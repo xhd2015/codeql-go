@@ -102,12 +102,18 @@ func ExtractWithFlags(buildFlags []string, patterns []string) error {
 	extractUniverseScope()
 	log.Println("Done extracting universe scope.")
 
-	// a map of package path to package root directory (currently the module root or the source directory)
-	pkgRoots := make(map[string]string)
-	// a map of package path to source code directory
-	pkgDirs := make(map[string]string)
+	// a map of package path to source directory and module root directory
+	pkgInfos := make(map[string]*util.PkgInfo)
 	// root directories of packages that we want to extract
 	wantedRoots := make(map[string]bool)
+
+	log.Printf("Running go list to resolve package and module directories.")
+	// get all packages information
+	pkgInfos, err = util.GetPkgsInfo(patterns, true, modFlags...)
+	if err != nil {
+		log.Fatalf("Error getting dependency package or module directories: %v.", err)
+	}
+	log.Printf("Done running go list deps: resolved %d packages.", len(pkgInfos))
 
 	// recursively visit all packages in depth-first order;
 	// on the way down, associate each package scope with its corresponding package,
@@ -116,18 +122,6 @@ func ExtractWithFlags(buildFlags []string, patterns []string) error {
 		return true
 	}, func(pkg *packages.Package) {
 		log.Printf("Processing package %s.", pkg.PkgPath)
-
-		if _, ok := pkgRoots[pkg.PkgPath]; !ok {
-			mdir := util.GetModDir(pkg.PkgPath, modFlags...)
-			pdir := util.GetPkgDir(pkg.PkgPath, modFlags...)
-			// GetModDir returns the empty string if the module directory cannot be determined, e.g. if the package
-			// is not using modules. If this is the case, fall back to the package directory
-			if mdir == "" {
-				mdir = pdir
-			}
-			pkgRoots[pkg.PkgPath] = mdir
-			pkgDirs[pkg.PkgPath] = pdir
-		}
 
 		log.Printf("Extracting types for package %s.", pkg.PkgPath)
 
@@ -153,11 +147,21 @@ func ExtractWithFlags(buildFlags []string, patterns []string) error {
 	})
 
 	for _, pkg := range pkgs {
-		if pkgRoots[pkg.PkgPath] == "" {
+		info := pkgInfos[pkg.PkgPath]
+		if info == nil {
+			var err error
+			info, err = util.GetPkgInfo(pkg.PkgPath)
+			if err != nil {
+				log.Fatalf("Unable to get a source directory for input package %s: %s", pkg.PkgPath, err)
+			}
+		}
+		if info == nil || info.PkgDir == "" {
 			log.Fatalf("Unable to get a source directory for input package %s.", pkg.PkgPath)
 		}
-		wantedRoots[pkgRoots[pkg.PkgPath]] = true
-		wantedRoots[pkgDirs[pkg.PkgPath]] = true
+		wantedRoots[info.PkgDir] = true
+		if info.ModDir != "" {
+			wantedRoots[info.ModDir] = true
+		}
 	}
 
 	log.Println("Done processing dependencies.")
@@ -175,7 +179,9 @@ func ExtractWithFlags(buildFlags []string, patterns []string) error {
 		return true
 	}, func(pkg *packages.Package) {
 		for root, _ := range wantedRoots {
-			relDir, err := filepath.Rel(root, pkgDirs[pkg.PkgPath])
+			info := pkgInfos[pkg.PkgPath]
+
+			relDir, err := filepath.Rel(root, info.PkgDir)
 			if err != nil || noExtractRe.MatchString(relDir) {
 				// if the path can't be made relative or matches the noExtract regexp skip it
 				continue
@@ -183,8 +189,8 @@ func ExtractWithFlags(buildFlags []string, patterns []string) error {
 
 			extraction.extractPackage(pkg)
 
-			if pkgRoots[pkg.PkgPath] != "" {
-				modPath := filepath.Join(pkgRoots[pkg.PkgPath], "go.mod")
+			if info.ModDir != "" {
+				modPath := filepath.Join(info.ModDir, "go.mod")
 				if util.FileExists(modPath) {
 					log.Printf("Extracting %s", modPath)
 					start := time.Now()
@@ -458,7 +464,7 @@ func (extraction *Extraction) extractError(tw *trap.Writer, err packages.Error, 
 		e         error
 	)
 
-	if pos == "" {
+	if pos == "" || pos == "-" {
 		// extract a dummy file
 		wd, e := os.Getwd()
 		if e != nil {
@@ -590,15 +596,6 @@ func (extraction *Extraction) extractFile(ast *ast.File, pkg *packages.Package) 
 	return nil
 }
 
-// stemAndExt splits a given file name into its stem (the part before the last '.')
-// and extension (the part after the last '.')
-func stemAndExt(base string) (string, string) {
-	if i := strings.LastIndexByte(base, '.'); i >= 0 {
-		return base[:i], base[i+1:]
-	}
-	return base, ""
-}
-
 // extractFileInfo extracts file-system level information for the given file, populating
 // the `files` and `containerparent` tables
 func (extraction *Extraction) extractFileInfo(tw *trap.Writer, file string) {
@@ -627,9 +624,8 @@ func (extraction *Extraction) extractFileInfo(tw *trap.Writer, file string) {
 			path = parentPath + "/" + component
 		}
 		if i == len(components)-1 {
-			stem, ext := stemAndExt(component)
 			lbl := tw.Labeler.FileLabelFor(file)
-			dbscheme.FilesTable.Emit(tw, lbl, path, stem, ext, 0)
+			dbscheme.FilesTable.Emit(tw, lbl, path)
 			dbscheme.ContainerParentTable.Emit(tw, parentLbl, lbl)
 			dbscheme.HasLocationTable.Emit(tw, lbl, emitLocation(tw, lbl, 0, 0, 0, 0))
 			extraction.Lock.Lock()
@@ -639,7 +635,7 @@ func (extraction *Extraction) extractFileInfo(tw *trap.Writer, file string) {
 			break
 		}
 		lbl := tw.Labeler.GlobalID(util.EscapeTrapSpecialChars(path) + ";folder")
-		dbscheme.FoldersTable.Emit(tw, lbl, path, component)
+		dbscheme.FoldersTable.Emit(tw, lbl, path)
 		if i > 0 {
 			dbscheme.ContainerParentTable.Emit(tw, parentLbl, lbl)
 		}
